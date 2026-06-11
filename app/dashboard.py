@@ -190,14 +190,14 @@ if page == PAGES[0]:
 
     c1, c2, c3, c4 = st.columns(4)
     feat = load_features()
-    sim = load_sim_results()
+    sim = compute_wc2026_tournament(rev=_data_rev())  # same 2026 sim as the Simulator tab
     mr = load_model_results()
 
     with c1:
         st.metric("Historical Matches", f"{len(feat):,}" if feat is not None else "–")
     with c2:
         n_teams = len(sim) if sim is not None else 0
-        st.metric("Teams Modelled", n_teams or "–")
+        st.metric("Teams (2026)", n_teams or "–")
     with c3:
         st.metric("MC Simulations", "5,000")
     with c4:
@@ -235,10 +235,11 @@ python main.py
 streamlit run app/dashboard.py
         """, language="bash")
 
-    if sim is not None:
+    if sim is not None and not sim.empty:
         st.markdown("---")
         st.subheader("Top 5 Tournament Favourites")
-        top5 = sim.head(5)[["team", "p_winner", "p_final", "p_sf"]]
+        st.caption("From 5,000 Monte Carlo runs of the real 2026 bracket (reputation-adjusted Elo).")
+        top5 = sim.head(5)[["team", "p_winner", "p_final", "p_sf"]].copy()
         top5.columns = ["Team", "Win %", "Final %", "Semi-Final %"]
         for col in ["Win %", "Final %", "Semi-Final %"]:
             top5[col] = (top5[col] * 100).round(1)
