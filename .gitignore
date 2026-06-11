@@ -1,0 +1,26 @@
+# Local Python environments
+env/
+.venv/
+venv/
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local tooling and scratch files
+.claude/
+_pdf_dump.txt
+
+# Training/runtime scratch output
+catboost_info/
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

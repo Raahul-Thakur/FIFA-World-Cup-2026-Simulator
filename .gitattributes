@@ -1,0 +1,2 @@
+# Store trained model binaries in Git LFS so GitHub accepts files over 100 MB.
+models_saved/*.joblib filter=lfs diff=lfs merge=lfs -text
