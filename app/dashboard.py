@@ -160,6 +160,64 @@ def compute_wc2026_tournament(n_simulations: int = 5000, rev: str = ""):
     return run_wc2026_simulation(elos, n_simulations=n_simulations, seed=0)
 
 
+RESULTS_CSV = Path("data/processed/results_2026.csv")
+
+
+def load_saved_results() -> dict:
+    """Load entered 2026 results from CSV -> {(home, away): (hg, ag)}."""
+    if RESULTS_CSV.exists():
+        df = pd.read_csv(RESULTS_CSV)
+        return {
+            (r.home, r.away): (int(r.home_score), int(r.away_score))
+            for r in df.itertuples()
+            if pd.notna(r.home_score) and pd.notna(r.away_score)
+        }
+    return {}
+
+
+@st.cache_data(show_spinner="Re-modelling with your results …")
+def compute_live_update(results_items: tuple, rev: str = "", n_simulations: int = 5000):
+    """Re-forecast everything given completed results.
+
+    `results_items` is a hashable tuple of (home, away, hg, ag). Returns updated
+    Elo, live standings, re-predicted remaining fixtures, and conditioned sim odds.
+    """
+    from src.models.predictor import predict_match
+    from src.models.goals_model import predict_fixture
+    from src.models.live_update import apply_results_to_elo, group_standings, split_fixtures
+    from src.simulation.simulator import run_wc2026_simulation
+    from src.data.wc2026 import elo_name, host_advantage
+    from src.data.reputation import adjusted_elo
+
+    model, model_name = load_trained_model()
+    base = load_current_elos()
+    if model is None or not base:
+        return None
+
+    results = {(h, a): (hg, ag) for (h, a, hg, ag) in results_items}
+    updated = apply_results_to_elo(base, results)
+    standings = group_standings(results)
+    _, remaining = split_fixtures()
+
+    rows = []
+    for fx in remaining:
+        home, away = fx["home"], fx["away"]
+        he = adjusted_elo(home, updated.get(elo_name(home), 1500))
+        aw = adjusted_elo(away, updated.get(elo_name(away), 1500))
+        neutral = not host_advantage(home, away)
+        oc = predict_match(model, home, away, he, aw,
+                           _elo_stats(he), _elo_stats(aw),
+                           neutral=neutral, is_world_cup=True, is_knockout=False)
+        pred = predict_fixture(home, away, he, aw, neutral=neutral, outcome_probs=oc)
+        pred.update({"group": fx["group"], "date": fx["date"],
+                     "time": fx.get("time", ""), "venue": fx.get("venue", "")})
+        rows.append(pred)
+
+    sim = run_wc2026_simulation(updated, n_simulations=n_simulations, seed=0,
+                                played_results=results)
+    return {"standings": standings, "remaining": rows, "sim": sim, "model_name": model_name}
+
+
 # ── sidebar navigation ────────────────────────────────────────────────────────
 PAGES = [
     "🏠 Home",
@@ -169,6 +227,7 @@ PAGES = [
     "📈 Probability Charts",
     "🔬 Model Evaluation",
     "🧠 Feature Importance",
+    "🔴 Live Update",
 ]
 
 with st.sidebar:
@@ -872,3 +931,161 @@ elif page == PAGES[6]:
                     st.info("SHAP values computed. Re-run `python main.py` to generate the plot.")
             else:
                 st.warning("SHAP analysis not available for this model.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Page 8 — Live Update (in-tournament re-forecast)
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == PAGES[7]:
+    st.title("🔴 Live Update — In-Tournament Re-Forecast")
+    from src.models.live_update import split_fixtures, GROUPS as LU_GROUPS
+
+    model, _ = load_trained_model()
+    if model is None:
+        st.warning("No trained model found. Run `python main.py` first.")
+        st.stop()
+
+    played, remaining = split_fixtures()
+    st.markdown(
+        f"Enter the **actual scorelines** for the **{len(played)} completed matches** "
+        f"(through Turkey vs Paraguay). The engine updates each team's Elo, rebuilds the "
+        f"live group tables, and re-forecasts the **{len(remaining)} remaining** fixtures "
+        f"plus qualification odds. Leave a row blank if it hasn't been played."
+    )
+
+    saved = load_saved_results()
+    editor_df = pd.DataFrame([
+        {
+            "Group": f["group"],
+            "Date": f["date"],
+            "Match": f"{f['home']} vs {f['away']}",
+            "Home": saved.get((f["home"], f["away"]), (None, None))[0],
+            "Away": saved.get((f["home"], f["away"]), (None, None))[1],
+        }
+        for f in played
+    ])
+
+    edited = st.data_editor(
+        editor_df,
+        hide_index=True,
+        use_container_width=True,
+        height=430,
+        disabled=["Group", "Date", "Match"],
+        column_config={
+            "Home": st.column_config.NumberColumn("Home Score", min_value=0, max_value=20, step=1),
+            "Away": st.column_config.NumberColumn("Away Score", min_value=0, max_value=20, step=1),
+        },
+        key="results_editor",
+    )
+
+    cbtn1, cbtn2 = st.columns([1, 3])
+    with cbtn1:
+        do_update = st.button("💾 Save & Re-model", type="primary", use_container_width=True)
+    with cbtn2:
+        if st.button("🗑️ Clear all results", use_container_width=True):
+            if RESULTS_CSV.exists():
+                RESULTS_CSV.unlink()
+            st.rerun()
+
+    results = saved
+    if do_update:
+        new_results, rows_to_save = {}, []
+        for i, f in enumerate(played):
+            hs, as_ = edited.iloc[i]["Home"], edited.iloc[i]["Away"]
+            if pd.notna(hs) and pd.notna(as_):
+                new_results[(f["home"], f["away"])] = (int(hs), int(as_))
+                rows_to_save.append({"home": f["home"], "away": f["away"],
+                                     "home_score": int(hs), "away_score": int(as_)})
+        if rows_to_save:
+            pd.DataFrame(rows_to_save).to_csv(RESULTS_CSV, index=False)
+        results = new_results
+        st.success(f"Saved {len(results)} results — re-modelling…")
+
+    if not results:
+        st.info("Enter scorelines above and click **Save & Re-model** to see the updated forecast.")
+        st.stop()
+
+    items = tuple(sorted((h, a, hg, ag) for (h, a), (hg, ag) in results.items()))
+    data = compute_live_update(items, _data_rev())
+    if data is None:
+        st.warning("Could not compute update.")
+        st.stop()
+
+    standings, rem_preds, sim = data["standings"], data["remaining"], data["sim"]
+    st.caption(f"Re-modelled from **{len(results)}** completed matches · model **{data['model_name']}**")
+
+    lu_tabs = st.tabs(["📋 Live Standings", "🔮 Remaining Fixtures", "🎟️ Updated Odds"])
+
+    # ── Live standings ──────────────────────────────────────────────────────────
+    with lu_tabs[0]:
+        grp = st.selectbox("Group", list(LU_GROUPS.keys()), key="lu_group")
+        rows = standings[grp]
+        tdf = pd.DataFrame(rows)[["team", "played", "W", "D", "L", "GF", "GA", "GD", "Pts"]]
+        tdf.columns = ["Team", "P", "W", "D", "L", "GF", "GA", "GD", "Pts"]
+        st.markdown(f"**Group {grp} — current table** (actual results)")
+        st.dataframe(tdf, use_container_width=True, hide_index=True)
+
+        gsim = sim[sim["group"] == grp][["team", "p_pos1", "p_pos2", "p_ro32"]].copy()
+        for c in ["p_pos1", "p_pos2", "p_ro32"]:
+            gsim[c] = (gsim[c] * 100).round(1)
+        gsim.columns = ["Team", "Win group %", "Runner-up %", "Reach R32 %"]
+        st.markdown("**Updated qualification odds** (conditioned on results so far)")
+        st.dataframe(gsim, use_container_width=True, hide_index=True)
+
+    # ── Remaining fixtures (re-predicted) ───────────────────────────────────────
+    with lu_tabs[1]:
+        st.markdown(f"Re-predicted **{len(rem_preds)}** remaining group fixtures (updated Elo).")
+        gfilter = st.selectbox("Group", ["All"] + list(LU_GROUPS.keys()), key="lu_rem_group")
+        rdf = pd.DataFrame(rem_preds)
+        view = rdf if gfilter == "All" else rdf[rdf["group"] == gfilter]
+        for _, r in view.iterrows():
+            home, away = r["home"], r["away"]
+            sh, sa = r["likely_score"]
+            badge = "🤔" if r.get("tossup") else "⚽"
+            header = f"**Group {r['group']}** · {r['date']} — {home} vs {away}  →  {sh}–{sa}"
+            with st.expander(header):
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric(f"{home} win", f"{r['p_home']*100:.0f}%")
+                m2.metric("Draw", f"{r['p_draw']*100:.0f}%")
+                m3.metric(f"{away} win", f"{r['p_away']*100:.0f}%")
+                m4.metric("Predicted score", f"{sh}–{sa}")
+                st.markdown(
+                    f"{badge} **{r['verdict']}** · Σ goals **{r['exp_total_goals']:.1f}** "
+                    f"({home} {r['home_xg']:.1f} xG, {away} {r['away_xg']:.1f} xG)"
+                )
+                mk = r.get("markets")
+                if mk:
+                    tops = " · ".join(f"{t['score']} ({t['prob']*100:.0f}%)" for t in mk["top_scores"][:5])
+                    st.markdown(
+                        f"**Likely scorelines:** {tops}  \n"
+                        f"**Markets:** draw {mk['p_draw']*100:.0f}% · over 2.5 {mk['p_over25']*100:.0f}% · "
+                        f"both score {mk['p_btts']*100:.0f}%"
+                    )
+
+    # ── Updated odds ────────────────────────────────────────────────────────────
+    with lu_tabs[2]:
+        st.markdown("**Title race** and **Round-of-32 qualification**, conditioned on results so far.")
+        fig = px.bar(
+            sim.head(16), x="team", y="p_winner",
+            color="p_winner", color_continuous_scale="Viridis",
+            title="Updated Tournament Winner Probabilities (Top 16)",
+            labels={"p_winner": "Win Probability", "team": "Team"},
+            text=sim.head(16)["p_winner"].mul(100).round(1).astype(str) + "%",
+        )
+        fig.update_layout(template="plotly_dark", height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+        ro32 = sim.sort_values("p_ro32", ascending=False)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Projected to qualify (top 32)**")
+            q = ro32.head(32)[["team", "group", "p_ro32"]].copy()
+            q["p_ro32"] = (q["p_ro32"] * 100).round(1)
+            q.columns = ["Team", "Group", "Qualify %"]
+            st.dataframe(q, use_container_width=True, hide_index=True, height=400)
+        with c2:
+            st.markdown("**On the bubble / out (33–48)**")
+            o = ro32.iloc[32:][["team", "group", "p_ro32"]].copy()
+            o["p_ro32"] = (o["p_ro32"] * 100).round(1)
+            o.columns = ["Team", "Group", "Qualify %"]
+            st.dataframe(o, use_container_width=True, hide_index=True, height=400)

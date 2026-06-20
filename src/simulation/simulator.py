@@ -269,19 +269,26 @@ def run_simulation(
 # and Round-of-32 qualification (top 2 per group + 8 best third-placed teams).
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _simulate_group_2026(teams: list, elo: dict, rng) -> list:
+def _simulate_group_2026(teams: list, elo: dict, rng, fixed: dict = None) -> list:
     """Round-robin group → standings as list of dicts with pts/gd/gf, ranked.
 
     Ranking: points → goal difference → goals for → random tiebreak (FIFA order,
-    head-to-head omitted for simplicity).
+    head-to-head omitted for simplicity).  `fixed` maps an ordered (ta, tb) pair
+    to a known (ta_goals, tb_goals) result so already-played matches are used
+    verbatim instead of simulated.
     """
+    fixed = fixed or {}
     pts = {t: 0 for t in teams}
     gd = {t: 0 for t in teams}
     gf = {t: 0 for t in teams}
 
     for i, ta in enumerate(teams):
         for tb in teams[i + 1:]:
-            outcome, ga, gb = _simulate_match(ta, tb, elo, neutral=True, rng=rng)
+            if (ta, tb) in fixed:
+                ga, gb = fixed[(ta, tb)]
+                outcome = "a" if ga > gb else ("b" if gb > ga else "draw")
+            else:
+                outcome, ga, gb = _simulate_match(ta, tb, elo, neutral=True, rng=rng)
             gf[ta] += ga; gf[tb] += gb
             gd[ta] += ga - gb; gd[tb] += gb - ga
             if outcome == "a":
@@ -297,13 +304,18 @@ def _simulate_group_2026(teams: list, elo: dict, rng) -> list:
     return [{"team": t, "pts": pts[t], "gd": gd[t], "gf": gf[t]} for t in ranked]
 
 
-def run_wc2026_simulation(data_elos: dict, n_simulations: int = 5000, seed: int = 0) -> pd.DataFrame:
+def run_wc2026_simulation(data_elos: dict, n_simulations: int = 5000, seed: int = 0,
+                          played_results: dict = None) -> pd.DataFrame:
     """
     Monte Carlo over the real 2026 World Cup (48 teams, 12 groups), using each
     team's reputation-adjusted Elo.
 
     Qualification: group winners + runners-up (24) plus the 8 best third-placed
     teams advance to the Round of 32, then single-elimination to the Final.
+
+    `played_results`, when given, maps (home_display, away_display) → (hg, ag) for
+    already-completed group matches; those are used verbatim and only the rest of
+    the group stage is simulated (knockouts always simulated).
 
     Returns one row per team with:
       team, group, elo,
@@ -319,7 +331,20 @@ def run_wc2026_simulation(data_elos: dict, n_simulations: int = 5000, seed: int 
         team: adjusted_elo(team, data_elos.get(elo_name(team), 1500))
         for g in GROUPS.values() for team in g
     }
+
+    # Pre-built per-group lookup of fixed (already-played) results, both orientations.
+    fixed_by_group = defaultdict(dict)
     team_group = {team: g for g, members in GROUPS.items() for team in members}
+    if played_results:
+        for (home, away), score in played_results.items():
+            if score is None or score[0] is None or score[1] is None:
+                continue
+            g = team_group.get(home)
+            if g is None or team_group.get(away) != g:
+                continue  # only group-stage pairs
+            hg, ag = score
+            fixed_by_group[g][(home, away)] = (hg, ag)
+            fixed_by_group[g][(away, home)] = (ag, hg)
 
     ko_rounds = ["Round of 16", "Quarter-final", "Semi-final", "Final", "Winner"]
     pos_counts = defaultdict(lambda: [0, 0, 0, 0])   # team -> [p1,p2,p3,p4]
@@ -332,7 +357,7 @@ def run_wc2026_simulation(data_elos: dict, n_simulations: int = 5000, seed: int 
         thirds = []
         qualifiers = []
         for g in group_order:
-            standings = _simulate_group_2026(GROUPS[g], elo, rng)
+            standings = _simulate_group_2026(GROUPS[g], elo, rng, fixed=fixed_by_group.get(g))
             for pos, row in enumerate(standings):
                 pos_counts[row["team"]][pos] += 1
             qualifiers.extend([standings[0]["team"], standings[1]["team"]])
